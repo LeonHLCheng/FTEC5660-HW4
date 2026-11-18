@@ -262,7 +262,10 @@ def retrieve(index: Any, question: str) -> list[Document]:
                 i for i, c in enumerate(index["chunks"])
                 if company_key(c.metadata["company"]) == ckey
             ]
-            comp_indices.sort(key=lambda i: scores[i] + (2.0 if year and str(year) in index["chunks"][i].page_content else 0), reverse=True)
+            comp_indices.sort(
+                key=lambda i: (1 if year and str(year) in index["chunks"][i].page_content else 0, scores[i]),
+                reverse=True,
+            )
             for i in comp_indices[:2]:
                 candidates.append(index["chunks"][i])
         return candidates
@@ -282,7 +285,10 @@ def retrieve(index: Any, question: str) -> list[Document]:
             ]
             if type_filtered:
                 cand_indices = [cand_indices[i] for i in type_filtered]
-        cand_indices.sort(key=lambda i: scores[i] + (1.5 if year and str(year) in index["chunks"][i].page_content else 0), reverse=True)
+        cand_indices.sort(
+            key=lambda i: (1 if year and str(year) in index["chunks"][i].page_content else 0, scores[i]),
+            reverse=True,
+        )
         candidates = [index["chunks"][i] for i in cand_indices[:MAX_RETRIEVED]]
     # 4. Universal LLM Answerability Check
     # If the candidate chunks do not contain the answer, return []
