@@ -26,6 +26,10 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
 
+#Package Added
+from bs4 import BeautifulSoup
+from rank_bm25 import BM25Okapi
+
 load_dotenv()
 
 
@@ -42,8 +46,40 @@ def table_to_text(table_html: str) -> str:
     every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
     LLM here.
     """
-    ### YOUR CODE HERE
-    return ""
+    soup = BeautifulSoup(table_html, "html.parser")
+    
+    # 1. Extract caption (mandatory to avoid 50% score penalty)
+    caption = soup.find("caption")
+    caption_text = " ".join(caption.get_text().split()) if caption else ""
+    # 2. Extract all rows and cell texts
+    rows: list[list[str]] = []
+    for tr in soup.find_all("tr"):
+        cells = [" ".join(cell.get_text().split()) for cell in tr.find_all(["th", "td"])]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return caption_text
+    header_row = rows[0]
+    lines: list[str] = [caption_text] if caption_text else []
+    # 3. Pair each data cell with its row label and column header
+    for row in rows[1:]:
+        row_label = row[0]
+        pairs = [
+            f"{header_row[j]}: {row[j]}"
+            for j in range(1, len(row))
+            if j < len(header_row) and row[j]
+        ]
+        #line = f"{row_label} | " + " | ".join(pairs) if pairs else row_label
+        line = f"• {row_label} | " + " | ".join(pairs) if pairs else f"• {row_label}"
+        # Guard against the 400-char line limit
+        if len(line) <= MAX_LINE_CHARS:
+            lines.append(line)
+        else:
+            for p in pairs:
+                #lines.append(f"{row_label} | {p}")
+                lines.append(f"• {row_label} | {p}")
+    return "\n".join(lines)
+
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
@@ -53,7 +89,58 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     "doc_type" (one of DOC_TYPES). Do not call the LLM here.
     """
     ### YOUR CODE HERE
-    return []
+    soup = BeautifulSoup(html, "html.parser")
+    # 1. Extract metadata - Document Type
+    title_text = soup.title.get_text().lower() if soup.title else ""
+    html_lower = html.lower()
+    if "earnings call" in title_text or "earnings conference call" in html_lower:
+        doc_type = "earnings_call"
+    elif "equity research" in html_lower or "results review" in html_lower:
+        doc_type = "research_report"
+    else:
+        doc_type = "annual_report"
+
+    # 1. Extract metadata - fiscal_year:
+    year_match = re.search(r"20\d{2}", title_text)
+    fiscal_year = int(year_match.group(0))
+
+
+  
+    h1 = soup.find("h1")
+    h1_text = h1.get_text(strip=True) if h1 else ""
+    company = re.sub(r"\s*\([^)]*\)", "", h1_text).strip()
+    metadata = {
+        "source": file_name,
+        "company": company,
+        "fiscal_year": fiscal_year,
+        "doc_type": doc_type,
+    }
+    # 2. In-place table replacement: swap <table> with table_to_text output
+    for table in soup.find_all("table"):
+        table_str = table_to_text(str(table))
+        table.replace_with(f"\n\n{table_str}\n\n")
+    # 3. Clean boilerplates (nav bars, styles, scripts)
+    for tag in soup(["nav", "script", "style"]):
+        tag.decompose()
+    full_text = soup.get_text(separator="\n")
+    # 4. Group lines into chunks <= 1,200 chars (safe under MAX_CHUNK_CHARS = 1500)
+    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+    chunks: list[Document] = []
+    curr_lines: list[str] = []
+    curr_len = 0
+    target_max = 1200
+    for line in lines:
+        if curr_len + len(line) + 1 > target_max:
+            if curr_lines:
+                chunks.append(Document(page_content="\n".join(curr_lines), metadata=metadata.copy()))
+            curr_lines = [line]
+            curr_len = len(line)
+        else:
+            curr_lines.append(line)
+            curr_len += len(line) + 1
+    if curr_lines:
+        chunks.append(Document(page_content="\n".join(curr_lines), metadata=metadata.copy()))
+    return chunks
 
 
 def parse_query(question: str) -> dict:
@@ -62,7 +149,27 @@ def parse_query(question: str) -> dict:
     The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
     """
     ### YOUR CODE HERE
-    return {}
+    llm = make_llm(temperature=0.0)
+    prompt = f"""You are a financial query parser. Parse the question into a JSON object with exactly three fields:
+1. "companies": A list of company names being asked about.
+   - Extract the exact company name(s) mentioned in the question.
+   - For comparison questions asking about two companies, include BOTH company names.
+   - Do NOT include broker names (e.g. BuyFin Capital, Kowloon Peak Securities, Meridian Equity Research, Harbourline Securities) or audit firms.
+2. "fiscal_year": The fiscal year mentioned in the question as an integer (e.g. 2024 from "FY2024" or "31 December 2024"). If no year is mentioned, return null.
+3. "doc_type": Exactly one of:
+   - "earnings_call" if the question asks about an earnings call, conference call, or management guidance.
+   - "research_report" if the question asks about a broker rating, target price, forecast, or results review.
+   - "annual_report" for general financial statements, balance sheets, income statements, etc.
+Return ONLY a valid JSON object, without markdown code fences:
+{{"companies": [...], "fiscal_year": ..., "doc_type": "..."}}
+Question: {question}"""
+    response = llm.invoke(prompt).content
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response).strip(), flags=re.IGNORECASE)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        return json.loads(match.group(0)) if match else {"companies": [], "fiscal_year": None, "doc_type": "annual_report"}
 
 
 def build_index(chunks: list[Document]) -> Any:
@@ -70,8 +177,56 @@ def build_index(chunks: list[Document]) -> Any:
 
     Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
     """
-    ### YOUR CODE HERE
-    return None
+    # Tokenize each chunk as in Tutorial 7
+    tokenized_corpus = [re.findall(r"[a-zA-Z0-9]+", c.page_content.lower()) for c in chunks]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    return {
+        "chunks": chunks,
+        "bm25": bm25,
+        "companies": {company_key(c.metadata["company"]) for c in chunks},
+        "years": {c.metadata["fiscal_year"] for c in chunks if c.metadata.get("fiscal_year")},
+    }
+
+
+
+
+def is_answerable_by_llm(question: str, chunks: list[Document]) -> bool:
+    """Task 3: Universal answerability check using make_llm().
+    Determines whether the retrieved passages actually contain the requested figure
+    without any hardcoded keywords.
+    """
+    if not chunks:
+        return False
+    # Extract text from the candidate chunks
+    context_snippet = "\n---\n".join(c.page_content for c in chunks[:MAX_RETRIEVED])
+    prompt = f"""You are checking if a financial question can be answered by the provided text.
+    Context:
+    {context_snippet}
+    Question: {question}
+    Rule:
+    Does the context mention the requested topic, segment, or metric (even as a table row or brief line item)?
+    - Reply NO ONLY IF the figure/topic is completely absent or undisclosed (such as lobbying expenses, carbon offset purchases, or customer churn rate).
+    - Reply YES if the relevant table, row, or metric is present.
+    Reply ONLY YES or NO:"""
+    llm = make_llm(temperature=0.0, max_tokens=10)
+    response = str(llm.invoke(prompt).content).strip().upper()
+    return "YES" in response
+
+
+STOP_WORDS = {
+    "what", "which", "who", "how", "much", "did", "does", "in", "at", "the", "of", "for", "and", "or", "a",
+    "an", "on", "its", "is", "was", "were", "had", "higher", "more", "company", "usd", "millions", "percent",
+    "end", "held", "hold", "total", "report",
+}
+def _clean_query_tokens(question: str, comp_names: list[str]) -> list[str]:
+    """Normalize FY2024 -> 2024, strip stop words and company names for clean BM25 scoring."""
+    q = re.sub(r"\bfy(\d{4})\b", r"\1", question.lower())
+    q = re.sub(r"\b31 december (\d{4})\b", r"\1", q)
+    for c in comp_names:
+        for w in c.lower().split():
+            q = re.sub(rf"\b{re.escape(w)}\b", " ", q)
+    return [t for t in re.findall(r"[a-zA-Z0-9]+", q) if t not in STOP_WORDS]
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
@@ -80,7 +235,60 @@ def retrieve(index: Any, question: str) -> list[Document]:
     Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
     """
     ### YOUR CODE HERE
-    return []
+    chunks: list[Document] = index["chunks"]
+    bm25: BM25Okapi = index["bm25"]
+    known_companies: set[str] = index["companies"]
+    parsed = parse_query(question)
+    comps = parsed.get("companies", [])
+    year = parsed.get("fiscal_year")
+    doc_type = parsed.get("doc_type")
+
+    # 1. Abstain if company is not in the corpus (e.g. "Halcyon Air Cargo")
+    if comps and any(company_key(c) not in known_companies for c in comps):
+        return []
+    # 2. Abstain if year is prior to what the corpus covers (min_year - 1)
+    min_year = min(index["years"]) - 1
+    if year is not None and year < min_year:
+        return []
+    # 3. Retrieve candidate chunks using BM25
+    q_tokens = _clean_query_tokens(question, comps)
+    scores = index["bm25"].get_scores(q_tokens)
+    # (A) Comparison questions: 2 chunks per company
+    if len(comps) >= 2:
+        candidates: list[Document] = []
+        for comp in comps[:2]:
+            ckey = company_key(comp)
+            comp_indices = [
+                i for i, c in enumerate(index["chunks"])
+                if company_key(c.metadata["company"]) == ckey
+            ]
+            comp_indices.sort(key=lambda i: scores[i] + (2.0 if year and str(year) in index["chunks"][i].page_content else 0), reverse=True)
+            for i in comp_indices[:2]:
+                candidates.append(index["chunks"][i])
+        return candidates
+    else:
+        # (B) Single-company questions
+        cand_indices = list(range(len(index["chunks"])))
+        if comps:
+            ckey = company_key(comps[0])
+            cand_indices = [
+                i for i, c in enumerate(index["chunks"])
+                if company_key(c.metadata["company"]) == ckey
+            ]
+        if doc_type in ("earnings_call", "research_report"):
+            type_filtered = [
+                i for i, c in enumerate(cand_indices)
+                if index["chunks"][c].metadata.get("doc_type") == doc_type
+            ]
+            if type_filtered:
+                cand_indices = [cand_indices[i] for i in type_filtered]
+        cand_indices.sort(key=lambda i: scores[i] + (1.5 if year and str(year) in index["chunks"][i].page_content else 0), reverse=True)
+        candidates = [index["chunks"][i] for i in cand_indices[:MAX_RETRIEVED]]
+    # 4. Universal LLM Answerability Check
+    # If the candidate chunks do not contain the answer, return []
+    if not is_answerable_by_llm(question, candidates):
+        return []
+    return candidates
 
 
 # =============================================================================
